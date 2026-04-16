@@ -54,6 +54,36 @@ configs.
 
 Unit tests cover the new behavior plus backwards-compat scenarios.
 
+### Bug 3 — zombie socket: whatsmeow claims connected while inbound events silently stop
+
+In production we observed a state where the whatsmeow client's
+`IsConnected()` method returned `true` but WhatsApp's servers had
+silently stopped delivering inbound events. The existing reconnect
+supervisor bounced off `"websocket is already connected"` every 5
+minutes indefinitely; group messages were dropped for 30+ minutes
+until a manual launcher restart.
+
+Two complementary changes address this:
+
+1. **`reconnectWithBackoff` now escapes the "already connected" loop.**
+   When `client.Connect()` returns an error containing
+   `"already connected"`, the supervisor treats it as a signal that
+   whatsmeow's internal state is stuck on a half-open socket. It calls
+   `Disconnect()` to clear the stale handle, then retries `Connect()`
+   immediately (no backoff).
+
+2. **A new `healthWatchdog` goroutine detects silent zombies.** It
+   tracks `lastEventAt` (updated in `eventHandler` on every whatsmeow
+   event — messages, presence, appstate, keepalive). Every 2 minutes
+   it checks: if `IsConnected()` is true but no events have arrived
+   for 10 minutes, it calls `Disconnect()` so the normal
+   `*events.Disconnected` → reconnect flow takes over.
+
+10 minutes is a balance for family-chat workloads — quiet periods are
+common but rarely exceed 10 min of total silence across all event
+types. False-positive reconnects are cheap (~8 s, session preserved
+via SQLite) and strictly better than silent delivery failure.
+
 ## Building
 
 ```bash
@@ -72,6 +102,7 @@ Requires Go 1.21+. See the upstream [README](README.md) for full prerequisites.
 
 - [x] Upstream issue filed for `allow_from` LID handling — [sipeed/picoclaw#2540](https://github.com/sipeed/picoclaw/issues/2540)
 - [x] Upstream issue filed for `WhatsAppConfig.GroupTrigger` + mention handling — [sipeed/picoclaw#2541](https://github.com/sipeed/picoclaw/issues/2541)
+- [ ] Upstream issue to file for zombie-socket reconnect supervisor (Bug 3)
 - [ ] Upstream PR opened against `sipeed/picoclaw:main`
 
 ## License
