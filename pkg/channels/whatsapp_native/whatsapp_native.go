@@ -43,6 +43,13 @@ const (
 	reconnectInitial    = 5 * time.Second
 	reconnectMax        = 5 * time.Minute
 	reconnectMultiplier = 2.0
+
+	// Health watchdog: detects zombie sockets where whatsmeow's IsConnected()
+	// returns true but WhatsApp's servers have silently stopped delivering
+	// events. eventHandler updates lastEventAt on every whatsmeow event;
+	// healthWatchdog force-Disconnects when it goes stale.
+	healthCheckInterval = 2 * time.Minute
+	healthStaleAfter    = 10 * time.Minute
 )
 
 // WhatsAppNativeChannel implements the WhatsApp channel using whatsmeow (in-process, no external bridge).
@@ -58,7 +65,8 @@ type WhatsAppNativeChannel struct {
 	reconnectMu  sync.Mutex
 	reconnecting bool
 	stopping     atomic.Bool    // set once Stop begins; prevents new wg.Add calls
-	wg           sync.WaitGroup // tracks background goroutines (QR handler, reconnect)
+	wg           sync.WaitGroup // tracks background goroutines (QR handler, reconnect, health watchdog)
+	lastEventAt  atomic.Int64   // unix nanos of last whatsmeow event; read by healthWatchdog
 }
 
 // NewWhatsAppNativeChannel creates a WhatsApp channel that uses whatsmeow for connection.
@@ -210,6 +218,23 @@ func (c *WhatsAppNativeChannel) Start(ctx context.Context) error {
 
 	startOK = true
 	c.SetRunning(true)
+	c.lastEventAt.Store(time.Now().UnixNano()) // prime watchdog clock
+
+	// Launch health watchdog. Use the same reconnectMu + stopping protocol
+	// as the QR and reconnect goroutines so a concurrent Stop() cannot enter
+	// wg.Wait() while we call wg.Add(1).
+	c.reconnectMu.Lock()
+	if !c.stopping.Load() {
+		c.wg.Add(1)
+		c.reconnectMu.Unlock()
+		go func() {
+			defer c.wg.Done()
+			c.healthWatchdog()
+		}()
+	} else {
+		c.reconnectMu.Unlock()
+	}
+
 	logger.InfoC("whatsapp", "WhatsApp native channel connected")
 	return nil
 }
@@ -271,6 +296,10 @@ func (c *WhatsAppNativeChannel) Stop(ctx context.Context) error {
 }
 
 func (c *WhatsAppNativeChannel) eventHandler(evt any) {
+	// Record every event (messages, presence, appstate, keepalive, etc.) as
+	// a sign of life so healthWatchdog can distinguish a quiet-but-healthy
+	// socket from a zombie one.
+	c.lastEventAt.Store(time.Now().UnixNano())
 	switch evt.(type) {
 	case *events.Message:
 		c.handleIncoming(evt.(*events.Message))
@@ -329,6 +358,15 @@ func (c *WhatsAppNativeChannel) reconnectWithBackoff() {
 
 		logger.WarnCF("whatsapp", "WhatsApp reconnect failed", map[string]any{"error": err.Error()})
 
+		// "already connected" means whatsmeow's internal state is stuck on
+		// a half-open socket. Force Disconnect() so the next Connect()
+		// starts fresh, and retry immediately (no backoff).
+		if strings.Contains(err.Error(), "already connected") {
+			logger.InfoC("whatsapp", "Forcing Disconnect to clear stuck socket state")
+			client.Disconnect()
+			continue
+		}
+
 		select {
 		case <-c.runCtx.Done():
 			return
@@ -341,6 +379,53 @@ func (c *WhatsAppNativeChannel) reconnectWithBackoff() {
 				backoff = next
 			}
 		}
+	}
+}
+
+// healthWatchdog detects zombie sockets — the case where whatsmeow's
+// client.IsConnected() returns true but WhatsApp's servers have silently
+// stopped delivering events (half-open socket). When detected, it forces
+// Disconnect() so *events.Disconnected fires and the standard reconnect
+// supervisor takes over.
+//
+// Without this, half-open sockets can persist indefinitely: the TCP layer
+// is alive, whatsmeow's internal state says "connected", but no messages
+// arrive. Observed in production on 2026-04-16 — the reconnect supervisor
+// was spinning on "websocket is already connected" for 30+ minutes while
+// inbound group messages were silently dropped.
+func (c *WhatsAppNativeChannel) healthWatchdog() {
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.runCtx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		c.mu.Lock()
+		client := c.client
+		c.mu.Unlock()
+		if client == nil || !client.IsConnected() {
+			// Not connected: the reconnect supervisor owns recovery.
+			continue
+		}
+
+		lastNs := c.lastEventAt.Load()
+		if lastNs == 0 {
+			continue
+		}
+		staleness := time.Since(time.Unix(0, lastNs))
+		if staleness < healthStaleAfter {
+			continue
+		}
+
+		logger.WarnCF("whatsapp", "Zombie socket detected; forcing Disconnect to recover", map[string]any{
+			"staleness": staleness.String(),
+			"threshold": healthStaleAfter.String(),
+		})
+		client.Disconnect()
 	}
 }
 
