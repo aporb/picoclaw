@@ -449,16 +449,42 @@ func (c *WhatsAppNativeChannel) healthWatchdog() {
 	}
 }
 
+// extractTextAndContextInfo returns the first non-empty text payload and the
+// ContextInfo (containing MentionedJID etc.) from a whatsmeow message,
+// covering text and media-with-caption shapes. Without this, media messages
+// with @mention captions are silently dropped at the empty-content check
+// because the original handler only looked at Conversation and
+// ExtendedTextMessage.
+func extractTextAndContextInfo(msg *waE2E.Message) (string, *waE2E.ContextInfo) {
+	if msg == nil {
+		return "", nil
+	}
+	if txt := msg.GetConversation(); txt != "" {
+		// Plain conversation carries no ContextInfo; mentions are not possible here.
+		return txt, nil
+	}
+	if etm := msg.ExtendedTextMessage; etm != nil {
+		return etm.GetText(), etm.GetContextInfo()
+	}
+	if im := msg.ImageMessage; im != nil {
+		return im.GetCaption(), im.GetContextInfo()
+	}
+	if vm := msg.VideoMessage; vm != nil {
+		return vm.GetCaption(), vm.GetContextInfo()
+	}
+	if dm := msg.DocumentMessage; dm != nil {
+		return dm.GetCaption(), dm.GetContextInfo()
+	}
+	return "", nil
+}
+
 func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 	if evt.Message == nil {
 		return
 	}
 	senderID := evt.Info.Sender.String()
 	chatID := evt.Info.Chat.String()
-	content := evt.Message.GetConversation()
-	if content == "" && evt.Message.ExtendedTextMessage != nil {
-		content = evt.Message.ExtendedTextMessage.GetText()
-	}
+	content, _ := extractTextAndContextInfo(evt.Message)
 	content = utils.SanitizeMessageContent(content)
 
 	if content == "" {
@@ -539,11 +565,12 @@ func (c *WhatsAppNativeChannel) isMentionedInGroup(evt *events.Message) bool {
 		return false
 	}
 
-	// Collect the mention list from ContextInfo (only present on ExtendedTextMessage).
-	if evt.Message.ExtendedTextMessage == nil {
-		return false
-	}
-	ci := evt.Message.ExtendedTextMessage.GetContextInfo()
+	// Collect the mention list from ContextInfo. ContextInfo lives on
+	// ExtendedTextMessage for text, and on ImageMessage/VideoMessage/
+	// DocumentMessage for media with captions — all carry their own
+	// ContextInfo.MentionedJID. Use the shared extractor so handleIncoming
+	// and isMentionedInGroup agree on which message shapes to cover.
+	_, ci := extractTextAndContextInfo(evt.Message)
 	if ci == nil {
 		return false
 	}
