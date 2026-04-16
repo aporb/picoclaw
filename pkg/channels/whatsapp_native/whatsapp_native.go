@@ -68,7 +68,11 @@ func NewWhatsAppNativeChannel(
 	bus *bus.MessageBus,
 	storePath string,
 ) (channels.Channel, error) {
-	base := channels.NewBaseChannel("whatsapp_native", cfg, bus, cfg.AllowFrom, channels.WithMaxMessageLength(65536))
+	base := channels.NewBaseChannel("whatsapp_native", cfg, bus, cfg.AllowFrom,
+		channels.WithMaxMessageLength(65536),
+		channels.WithGroupTrigger(cfg.GroupTrigger),
+		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
+	)
 	if storePath == "" {
 		storePath = "whatsapp"
 	}
@@ -388,12 +392,85 @@ func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 		return
 	}
 
+	// Apply group trigger filtering for group chats only.
+	// DMs (Chat.Server != GroupServer) skip this block entirely.
+	if evt.Info.Chat.Server == types.GroupServer {
+		isMentioned := c.isMentionedInGroup(evt)
+		respond, cleaned := c.ShouldRespondInGroup(isMentioned, content)
+		if !respond {
+			logger.DebugCF(
+				"whatsapp",
+				"Group message not triggered",
+				map[string]any{
+					"sender_id":    senderID,
+					"is_mentioned": isMentioned,
+				},
+			)
+			return
+		}
+		content = cleaned
+	}
+
 	logger.DebugCF(
 		"whatsapp",
 		"WhatsApp message received",
 		map[string]any{"sender_id": senderID, "content_preview": utils.Truncate(content, 50)},
 	)
 	c.HandleMessage(c.runCtx, peer, messageID, senderID, chatID, content, mediaPaths, metadata, sender)
+}
+
+// isMentionedInGroup checks whether the bot's JID appears in ContextInfo.MentionedJID.
+// WhatsApp delivers mentions as plain strings in two formats:
+//   - "1234567890@s.whatsapp.net"  (phone-number / PN form)
+//   - "12345678901234567@lid"       (LID form, used in newer accounts/groups)
+//
+// We check both Store.ID (PN) and Store.LID against each entry.
+// Either or both may be unpopulated; we handle nil/empty gracefully.
+func (c *WhatsAppNativeChannel) isMentionedInGroup(evt *events.Message) bool {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil || client.Store == nil {
+		return false
+	}
+
+	// Collect the mention list from ContextInfo (only present on ExtendedTextMessage).
+	if evt.Message.ExtendedTextMessage == nil {
+		return false
+	}
+	ci := evt.Message.ExtendedTextMessage.GetContextInfo()
+	if ci == nil {
+		return false
+	}
+	mentions := ci.GetMentionedJID() // []string
+	if len(mentions) == 0 {
+		return false
+	}
+
+	// Build the set of self-JID strings to compare against.
+	// Store.ID is a *types.JID (nil before QR login; this path is only reached
+	// after Start() succeeds, but we guard anyway).
+	var selfPNStr string
+	if client.Store.ID != nil {
+		selfPNStr = client.Store.ID.ToNonAD().String() // e.g. "1234567890@s.whatsapp.net"
+	}
+
+	// Store.LID is a value type; GetLID() returns EmptyJID (Server=="") when unset.
+	selfLID := client.Store.GetLID()
+	var selfLIDStr string
+	if !selfLID.IsEmpty() {
+		selfLIDStr = selfLID.ToNonAD().String() // e.g. "12345678901234567@lid"
+	}
+
+	for _, m := range mentions {
+		if selfPNStr != "" && m == selfPNStr {
+			return true
+		}
+		if selfLIDStr != "" && m == selfLIDStr {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *WhatsAppNativeChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
