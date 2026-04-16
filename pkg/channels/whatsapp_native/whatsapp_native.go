@@ -426,6 +426,26 @@ func (c *WhatsAppNativeChannel) healthWatchdog() {
 			"threshold": healthStaleAfter.String(),
 		})
 		client.Disconnect()
+
+		// Disconnect() does NOT reliably fire *events.Disconnected when
+		// whatsmeow's internal state is corrupted (observed in prod). So
+		// trigger the reconnect supervisor directly, using the same
+		// reconnectMu + stopping + wg.Add protocol as eventHandler.
+		// lastEventAt is refreshed so the watchdog's next tick doesn't
+		// immediately re-trigger while reconnect is in flight.
+		c.lastEventAt.Store(time.Now().UnixNano())
+		c.reconnectMu.Lock()
+		if c.reconnecting || c.stopping.Load() {
+			c.reconnectMu.Unlock()
+			continue
+		}
+		c.reconnecting = true
+		c.wg.Add(1)
+		c.reconnectMu.Unlock()
+		go func() {
+			defer c.wg.Done()
+			c.reconnectWithBackoff()
+		}()
 	}
 }
 
