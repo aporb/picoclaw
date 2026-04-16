@@ -31,6 +31,25 @@ func ParseCanonicalID(canonical string) (platform, id string, ok bool) {
 	return canonical[:idx], canonical[idx+1:], true
 }
 
+// lidBaseParts parses a WhatsApp LID-format JID of the form "<user>@lid" or
+// "<user>:<device>@lid" and returns the base user part (before any colon).
+// Returns ("", false) if the string does not end with "@lid".
+func lidBaseParts(jid string) (base string, ok bool) {
+	const lidSuffix = "@lid"
+	if !strings.HasSuffix(jid, lidSuffix) {
+		return "", false
+	}
+	local := jid[:len(jid)-len(lidSuffix)] // everything before "@lid"
+	if local == "" {
+		return "", false
+	}
+	// Strip device/agent index if present: "<user>:<N>" → "<user>"
+	if idx := strings.LastIndex(local, ":"); idx > 0 {
+		return local[:idx], true
+	}
+	return local, true
+}
+
 // MatchAllowed checks whether the given sender matches a single allow-list entry.
 // It is backward-compatible with all legacy formats:
 //
@@ -43,6 +62,27 @@ func MatchAllowed(sender bus.SenderInfo, allowed string) bool {
 	if allowed == "" {
 		return false
 	}
+
+	// --- NEW BLOCK: bare-LID matching ---
+	// Trigger only when the allow-list entry is a bare LID: ends with "@lid"
+	// AND contains no ":" before the "@" (i.e., no device suffix).
+	// If the entry already has a device suffix, fall through to exact-match below.
+	const lidSuffix = "@lid"
+	if strings.HasSuffix(allowed, lidSuffix) {
+		localPart := allowed[:len(allowed)-len(lidSuffix)]
+		isBare := localPart != "" && !strings.Contains(localPart, ":")
+		if isBare {
+			// Sender must also be a LID JID; non-LID senders never match a LID entry.
+			senderBase, senderIsLID := lidBaseParts(sender.PlatformID)
+			if !senderIsLID {
+				return false
+			}
+			return senderBase == localPart
+		}
+		// Device-suffixed allow-list entry (e.g., "200149888417807:95@lid"):
+		// fall through to exact-match logic below.
+	}
+	// --- END NEW BLOCK ---
 
 	// Try canonical match first: "platform:id" format
 	if platform, id, ok := ParseCanonicalID(allowed); ok {

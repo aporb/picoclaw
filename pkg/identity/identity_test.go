@@ -259,3 +259,117 @@ func TestIsNumeric(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchAllowedLID(t *testing.T) {
+	// Helper to build a WhatsApp-style LID sender.
+	lidSender := func(jid string) bus.SenderInfo {
+		return bus.SenderInfo{
+			Platform:   "whatsapp",
+			PlatformID: jid,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		sender  bus.SenderInfo
+		allowed string
+		want    bool
+	}{
+		// Bare LID allow + device-suffixed sender → match (core new behavior)
+		{
+			name:    "bare LID allow matches device-suffixed sender",
+			sender:  lidSender("200149888417807:95@lid"),
+			allowed: "200149888417807@lid",
+			want:    true,
+		},
+		// Bare LID allow + different device index → still matches
+		{
+			name:    "bare LID allow matches different device index",
+			sender:  lidSender("200149888417807:96@lid"),
+			allowed: "200149888417807@lid",
+			want:    true,
+		},
+		// Bare LID allow + bare LID sender (no device suffix on wire) → match
+		{
+			name:    "bare LID allow matches bare LID sender",
+			sender:  lidSender("200149888417807@lid"),
+			allowed: "200149888417807@lid",
+			want:    true,
+		},
+		// Bare LID allow + different base → no match
+		{
+			name:    "bare LID allow does not match different base LID",
+			sender:  lidSender("999999999999999:95@lid"),
+			allowed: "200149888417807@lid",
+			want:    false,
+		},
+		// Device-suffixed allow + exact sender → match (backwards compat)
+		{
+			name:    "device-suffixed allow matches exact sender",
+			sender:  lidSender("200149888417807:95@lid"),
+			allowed: "200149888417807:95@lid",
+			want:    true,
+		},
+		// Device-suffixed allow + different device → no match (backwards compat)
+		{
+			name:    "device-suffixed allow does not match different device",
+			sender:  lidSender("200149888417807:96@lid"),
+			allowed: "200149888417807:95@lid",
+			want:    false,
+		},
+		// Bare LID allow + phone-format sender → no match
+		{
+			name:    "bare LID allow does not match phone-format sender",
+			sender:  lidSender("15550001234@s.whatsapp.net"),
+			allowed: "200149888417807@lid",
+			want:    false,
+		},
+		// Bare LID allow + empty sender PlatformID → no match, no panic
+		{
+			name:    "bare LID allow with empty sender is safe",
+			sender:  bus.SenderInfo{Platform: "whatsapp", PlatformID: ""},
+			allowed: "200149888417807@lid",
+			want:    false,
+		},
+		// Bare LID allow + malformed sender (no @ at all) → no match, no panic
+		{
+			name:    "bare LID allow with malformed sender is safe",
+			sender:  bus.SenderInfo{Platform: "whatsapp", PlatformID: "notajid"},
+			allowed: "200149888417807@lid",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchAllowed(tt.sender, tt.allowed)
+			if got != tt.want {
+				t.Errorf("MatchAllowed(%+v, %q) = %v, want %v",
+					tt.sender, tt.allowed, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLIDBaseParts(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantBase string
+		wantOk   bool
+	}{
+		{"200149888417807:95@lid", "200149888417807", true},
+		{"200149888417807:96@lid", "200149888417807", true},
+		{"200149888417807@lid", "200149888417807", true},
+		{"@lid", "", false},                           // empty local part
+		{"200149888417807@s.whatsapp.net", "", false}, // not @lid
+		{"", "", false},
+		{"notajid", "", false},
+	}
+	for _, tt := range tests {
+		base, ok := lidBaseParts(tt.input)
+		if ok != tt.wantOk || base != tt.wantBase {
+			t.Errorf("lidBaseParts(%q) = (%q, %v), want (%q, %v)",
+				tt.input, base, ok, tt.wantBase, tt.wantOk)
+		}
+	}
+}

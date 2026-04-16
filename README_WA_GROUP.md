@@ -9,10 +9,14 @@ Parent commit: `51eecde0` (`Feat/support isolation #2423`), `main` as of 2026-04
 
 ## What this fixes
 
-Before these patches, `channels.whatsapp.group_trigger.mention_only: true` in
-`config.json` was silently ignored on the `whatsapp_native` channel. The bot
-replied to every message in every WhatsApp group, regardless of whether it was
-`@`-mentioned. Four compounded defects caused this:
+This fork addresses two related-but-distinct bugs in the `whatsapp_native`
+channel, both affecting accounts that have been migrated by Meta to the new
+LID (Linked-Device ID) identity format.
+
+### Bug 1 — `group_trigger.mention_only: true` is silently ignored
+
+Before these patches, the bot replied to every message in every WhatsApp group,
+regardless of whether it was `@`-mentioned. Four compounded defects caused this:
 
 1. **`WhatsAppConfig` was missing the `GroupTrigger` field.** Every other
    channel config struct had it. Without the field, `encoding/json` had nowhere
@@ -30,9 +34,25 @@ replied to every message in every WhatsApp group, regardless of whether it was
    Discord, Line, IRC, QQ — all call `ShouldRespondInGroup(isMentioned, content)`
    before forwarding to the agent bus. The native WhatsApp channel didn't.
 
-The patches handle the LID/PN JID duality that's already rolled out to many
-WhatsApp accounts: `Store.ID` (phone-number form) and `Store.GetLID()` (LID
-form) are both checked against the mention list.
+The patches handle the LID/PN JID duality: `Store.ID` (phone-number form) and
+`Store.GetLID()` (LID form) are both checked against the mention list.
+
+### Bug 2 — `allow_from` silently drops device-index-drifting LIDs
+
+On LID-migrated accounts, sender JIDs arrive as `<user>:<N>@lid` where `:N` is
+a device/agent index that can shift during normal WhatsApp session
+housekeeping. The existing `identity.MatchAllowed` does exact-string comparison
+against the stored allow-list entry, which silently breaks the moment `N`
+changes.
+
+The added `lidBaseParts` helper and a short new branch at the top of
+`MatchAllowed` handle this: when an allow-list entry is a bare LID
+(`<user>@lid`, no colon), the sender's device suffix is stripped before the
+base part is compared. Allow-list entries that include an explicit device
+suffix continue to use exact-match — fully backwards compatible for existing
+configs.
+
+Unit tests cover the new behavior plus backwards-compat scenarios.
 
 ## Building
 
@@ -50,8 +70,8 @@ Requires Go 1.21+. See the upstream [README](README.md) for full prerequisites.
 
 ## Status
 
-- [ ] Upstream issue filed for `WhatsAppConfig.GroupTrigger` field + mention handling
-- [ ] Upstream issue filed for `allow_from` LID handling (separate bug, same channel)
+- [x] Upstream issue filed for `allow_from` LID handling — [sipeed/picoclaw#2540](https://github.com/sipeed/picoclaw/issues/2540)
+- [x] Upstream issue filed for `WhatsAppConfig.GroupTrigger` + mention handling — [sipeed/picoclaw#2541](https://github.com/sipeed/picoclaw/issues/2541)
 - [ ] Upstream PR opened against `sipeed/picoclaw:main`
 
 ## License
